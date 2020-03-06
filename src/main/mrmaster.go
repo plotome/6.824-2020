@@ -20,7 +20,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 创建一个 Master，参数为一组文件名以及 reduce 文件数
 	m := mr.MakeMaster(os.Args[1:], 10)
+	// 周期性判断任务是否完成，完成后即退出
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}

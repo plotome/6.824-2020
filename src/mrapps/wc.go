@@ -20,11 +20,13 @@ import "strconv"
 //
 func Map(filename string, contents string) []mr.KeyValue {
 	// function to detect word separators.
+	// 将 string 分成一组单词，ff 为 FieldsFunc 的参数
 	ff := func(r rune) bool { return !unicode.IsLetter(r) }
 
 	// split contents into an array of words.
 	words := strings.FieldsFunc(contents, ff)
 
+	// 创建一个 kv 类型的数组 <-- map 函数的输出
 	kva := []mr.KeyValue{}
 	for _, w := range words {
 		kv := mr.KeyValue{w, "1"}

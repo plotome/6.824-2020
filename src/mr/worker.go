@@ -1,6 +1,9 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
@@ -31,8 +34,23 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 
-	// uncomment to send the ReplyTaskToWorker RPC to the master.
-	TaskRequest()
+	for {
+		task := TaskRequest()
+		// 注意可能会出现整体任务未完成，但是没有活干的情况，
+		// 这时候不能退出，使用 task.Ok 判断该情况，然后等待
+		// 一段时间之后再次向 master 发出请求
+		if task.TaskType == Free {
+			break
+		} else if !task.Ok {
+			// 整体任务未完成，但是没有活干的情况
+			// 等待 1s 钟后轮询
+			time.Sleep(time.Second)
+			continue
+		}
+		// 测试时暂时用延迟代替实际任务
+		time.Sleep(3 * time.Second)
+		TaskFinishedReport(task.File, task.TaskType)
+	}
 
 }
 
@@ -41,7 +59,7 @@ func Worker(mapf func(string, string) []KeyValue,
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
-func TaskRequest() {
+func TaskRequest() TaskReply {
 
 	// declare an argument structure.
 	args := TaskRequestArgs{}
@@ -52,8 +70,20 @@ func TaskRequest() {
 	// send the RPC request, wait for the reply.
 	call("Master.ReplyTaskToWorker", &args, &reply)
 
-	// reply.Y should be 100.
 	fmt.Printf("reply.File: %v, reply.TaskType: %v\n", reply.File, reply.TaskType)
+	return reply
+}
+
+// 任务完成后调用
+func TaskFinishedReport(file string, taskType TaskTypes) {
+	args := TaskFinishedArgs{
+		File:     file,
+		TaskType: taskType,
+	}
+	reply := TaskFinishedReply{}
+
+	call("Master.ReportFinishedTask", &args, &reply)
+	fmt.Printf("reply.Ok: %v \n", reply.Ok)
 }
 
 //

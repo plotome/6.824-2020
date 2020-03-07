@@ -20,8 +20,17 @@ type TaskRequestArgs struct {
 
 type TaskReply struct {
 	File     string
-	TaskType int
+	TaskType TaskTypes
 	Ok       bool
+}
+
+type TaskFinishedArgs struct {
+	TaskType TaskTypes
+	File     string
+}
+
+type TaskFinishedReply struct {
+	Ok bool
 }
 
 // Add your RPC definitions here.

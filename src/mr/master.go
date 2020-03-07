@@ -23,6 +23,7 @@ type TaskTypes int
 type Master struct {
 	// map 任务状态：UnStarted, Processing, Finished
 	MapTaskStatus TaskStatusMap
+	MapTaskNum    int
 
 	MapTaskFinished bool
 
@@ -93,6 +94,7 @@ func GetReduceFileName(index int) string {
 func (master *Master) ReplyTaskToWorker(args *TaskRequestArgs, reply *TaskReply) error {
 	file, taskType, taskId, ok := master.GetUnStartedTask()
 	reply.ReduceTaskNum = master.ReduceTaskNum
+	reply.MapTaskNum = master.MapTaskNum
 	reply.TaskId = taskId
 	reply.File = file
 	reply.TaskType = taskType
@@ -174,11 +176,10 @@ func (master *Master) IsPhaseFinished(taskType TaskTypes) bool {
 // 如果整个任务完成，返回 true
 func (master *Master) Done() bool {
 	// change ret := false to true so that the master exits immediately
-	ret := false
 	//ret := true
 	// Your code here.
 
-	return ret
+	return master.TaskStatus == Free
 }
 
 // 从 map/reduce 任务中获取一个没有开始的任务
@@ -217,7 +218,7 @@ func (master *Master) TimeOutDetection(file string, taskType int) {
 	defer master.RWMux.Unlock()
 	if taskType == MapTask {
 		if master.MapTaskStatus[file].TaskStatus == Processing {
-			fmt.Printf("The worker of Map %v has faild", file)
+			fmt.Printf("The worker of Map %v has faild\n", file)
 			master.MapTaskStatus[file].TaskStatus = UnStarted
 		}
 		return
@@ -225,7 +226,7 @@ func (master *Master) TimeOutDetection(file string, taskType int) {
 
 	if taskType == ReduceTask {
 		if master.ReduceTaskStatus[file].TaskStatus == Processing {
-			fmt.Printf("The worker of Reduce %v has faild", file)
+			fmt.Printf("The worker of Reduce %v has faild\n", file)
 			master.ReduceTaskStatus[file].TaskStatus = UnStarted
 		}
 		return
@@ -262,6 +263,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 		ReduceTaskStatus: InitReduceTaskStatus(nReduce),
 		RWMux:            &sync.RWMutex{},
 		TaskStatus:       MapTask,
+		MapTaskNum:       len(files),
 	}
 
 	//

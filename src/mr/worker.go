@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -29,6 +30,15 @@ func ihash(key string) int {
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
+
+// for sorting by key.
+// Array of Key-Value pairs
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // main/mrworker.go calls this function.
@@ -56,7 +66,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		if task.TaskType == MapTask {
 			MapTaskProcess(task, mapf)
 		} else if task.TaskType == ReduceTask {
-			time.Sleep(3 * time.Second)
+			ReduceTaskProcess(task, reducef)
 		}
 		// 测试时暂时用延迟代替实际任务
 		// time.Sleep(3 * time.Second)
@@ -66,9 +76,81 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 // Reduce 阶段处理过程
+func ReduceTaskProcess(task TaskReply,
+	reducef func(string, []string) string) {
+
+	// nReduce := task.ReduceTaskNum
+	// fileName := task.File
+	taskId := task.TaskId
+	mapTaskNum := task.MapTaskNum
+	// intermediate 已排序
+	intermediate := MergeInterFiles(mapTaskNum, taskId)
+
+	oname := "mr-out-" + strconv.Itoa(taskId)
+	WriteReduceResult(oname, intermediate, reducef)
+}
+
+// 调用 reducef 处理 kv 键值对，并将结果写入文件 oname
+func WriteReduceResult(oname string,
+	intermediate []KeyValue,
+	reducef func(string, []string) string) {
+
+	ofile, _ := os.Create(oname)
+	defer ofile.Close()
+
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		// call the reduce procedure
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		i = j
+	}
+	fmt.Printf("Reduce task : %v completed \n", oname)
+}
+
+func MergeInterFiles(mapTaskNum int, taskId int) []KeyValue {
+	kva := []KeyValue{}
+	for i := 0; i < mapTaskNum; i++ {
+		// 将 kv 键值对从 tempfiles 里全部读出来
+		tmpfile := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(taskId)
+		kva = ReadFromJSONFile(kva, tmpfile)
+	}
+
+	// 排序后返回（此时不需要写入到文件）
+	sort.Sort(ByKey(kva))
+	// oname := "mr-out-" + strconv.Itoa(taskId)
+	// WriteToJSONFile(kva, oname)
+	return kva
+}
+
+func ReadFromJSONFile(kva []KeyValue, tmpfile string) []KeyValue {
+	file, _ := os.Open(tmpfile)
+	defer file.Close()
+	dec := json.NewDecoder(file)
+	for {
+		var kv KeyValue
+		if err := dec.Decode(&kv); err != nil {
+			break
+		}
+		kva = append(kva, kv)
+	}
+	return kva
+}
 
 // Map 阶段处理过程
-func MapTaskProcess(task TaskReply, mapf func(string, string) []KeyValue) {
+func MapTaskProcess(task TaskReply,
+	mapf func(string, string) []KeyValue) {
+
 	nReduce := task.ReduceTaskNum
 	fileName := task.File
 	taskId := task.TaskId
@@ -80,7 +162,8 @@ func MapTaskProcess(task TaskReply, mapf func(string, string) []KeyValue) {
 
 	kvas := PartitionByKey(kva, nReduce)
 	for i := 0; i < nReduce; i++ {
-		WriteToJSONFile(kvas[i], taskId, i)
+		fileName := "mr-" + strconv.Itoa(taskId) + "-" + strconv.Itoa(i)
+		WriteToJSONFile(kvas[i], fileName)
 	}
 	fmt.Printf("Creat mr-temp files completed. \n")
 }
@@ -96,8 +179,7 @@ func PartitionByKey(kva []KeyValue, nReduce int) [][]KeyValue {
 }
 
 // 将文件写入到磁盘
-func WriteToJSONFile(intermediate []KeyValue, mapTaskId, idxOfSlice int) (string, bool) {
-	fileName := "mr-" + strconv.Itoa(mapTaskId) + "-" + strconv.Itoa(idxOfSlice)
+func WriteToJSONFile(intermediate []KeyValue, fileName string) (string, bool) {
 	// jsonFile, _ := ioutil.TempFile("./", fileName)
 	// 如果文件存在则清空文件
 	jsonFile, _ := os.Create(fileName)

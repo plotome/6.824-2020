@@ -19,6 +19,7 @@ type TaskRequestArgs struct {
 }
 
 type TaskReply struct {
+	MapTaskNum    int
 	ReduceTaskNum int
 	File          string
 	TaskId        int

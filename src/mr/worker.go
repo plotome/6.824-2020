@@ -1,7 +1,11 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"strconv"
 	"time"
 )
 import "log"
@@ -47,18 +51,90 @@ func Worker(mapf func(string, string) []KeyValue,
 			time.Sleep(time.Second)
 			continue
 		}
+
+		// 正式处理过程
+		if task.TaskType == MapTask {
+			MapTaskProcess(task, mapf)
+		} else if task.TaskType == ReduceTask {
+			time.Sleep(3 * time.Second)
+		}
 		// 测试时暂时用延迟代替实际任务
-		time.Sleep(3 * time.Second)
+		// time.Sleep(3 * time.Second)
 		TaskFinishedReport(task.File, task.TaskType)
 	}
 
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
+// Reduce 阶段处理过程
+
+// Map 阶段处理过程
+func MapTaskProcess(task TaskReply, mapf func(string, string) []KeyValue) {
+	nReduce := task.ReduceTaskNum
+	fileName := task.File
+	taskId := task.TaskId
+
+	content := LoadFileContent(fileName)
+
+	// kva 为文件内所有 key-value 键值对
+	kva := mapf(fileName, string(content))
+
+	kvas := PartitionByKey(kva, nReduce)
+	for i := 0; i < nReduce; i++ {
+		WriteToJSONFile(kvas[i], taskId, i)
+	}
+	fmt.Printf("Creat mr-temp files completed. \n")
+}
+
+// 将KeyValue 键值对按 Key 分到 nReduce 个分片里
+func PartitionByKey(kva []KeyValue, nReduce int) [][]KeyValue {
+	kvas := make([][]KeyValue, nReduce)
+	for _, kv := range kva {
+		idx := ihash(kv.Key) % nReduce
+		kvas[idx] = append(kvas[idx], kv)
+	}
+	return kvas
+}
+
+// 将文件写入到磁盘
+func WriteToJSONFile(intermediate []KeyValue, mapTaskId, idxOfSlice int) (string, bool) {
+	fileName := "mr-" + strconv.Itoa(mapTaskId) + "-" + strconv.Itoa(idxOfSlice)
+	// jsonFile, _ := ioutil.TempFile("./", fileName)
+	// 如果文件存在则清空文件
+	jsonFile, _ := os.Create(fileName)
+	defer jsonFile.Close() //关闭文件，释放资源
+	enc := json.NewEncoder(jsonFile)
+	for _, kv := range intermediate {
+		err := enc.Encode(&kv)
+		if err != nil {
+			log.Fatal("error: ", err)
+			return fileName, false
+		}
+	}
+	fmt.Printf("File : %v has saved\n", fileName)
+	return fileName, true
+}
+
+// 判断文件是否存在
+func IsFileExist(fileName string) bool {
+	_, err := os.Lstat(fileName)
+	return !os.IsNotExist(err)
+}
+
+// 将文件内容加载到内存中，便于后续使用
+func LoadFileContent(fileName string) []byte {
+	file, err := os.Open(fileName)
+	if err != nil {
+		log.Fatalf("cannot open %v", fileName)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", fileName)
+	}
+	file.Close()
+	return content
+}
+
+// 向 master 发送 task 请求
 func TaskRequest() TaskReply {
 
 	// declare an argument structure.

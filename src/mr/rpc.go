@@ -19,9 +19,11 @@ type TaskRequestArgs struct {
 }
 
 type TaskReply struct {
-	File     string
-	TaskType TaskTypes
-	Ok       bool
+	ReduceTaskNum int
+	File          string
+	TaskId        int
+	TaskType      TaskTypes
+	Ok            bool
 }
 
 type TaskFinishedArgs struct {

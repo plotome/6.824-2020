@@ -12,13 +12,18 @@ import "os"
 import "net/rpc"
 import "net/http"
 
-type TaskStatusMap map[string]int
+type TaskStatusMap map[string]*TaskDetail
+type TaskDetail struct {
+	TaskId     int
+	TaskStatus int
+}
 type TaskTypes int
 
 // Master 结构体，里面应该存储 Master 的所有必要信息（废话）
 type Master struct {
 	// map 任务状态：UnStarted, Processing, Finished
-	MapTaskStatus   TaskStatusMap
+	MapTaskStatus TaskStatusMap
+
 	MapTaskFinished bool
 
 	// Reduce Task 的个数，即 nReduce
@@ -43,13 +48,17 @@ const (
 	UnStarted = iota
 	Processing
 	Finished
+	UnGenerated
 )
 
 // 初始化 MapTaskStatus
 func InitMapTaskStatus(files []string) TaskStatusMap {
 	taskStatusMap := make(TaskStatusMap)
-	for _, file := range files {
-		taskStatusMap[file] = UnStarted
+	for i, file := range files {
+		taskStatusMap[file] = &TaskDetail{
+			TaskId:     i,
+			TaskStatus: UnStarted,
+		}
 	}
 	return taskStatusMap
 }
@@ -60,7 +69,12 @@ func InitReduceTaskStatus(nReduce int) TaskStatusMap {
 	taskStatusMap := make(TaskStatusMap)
 	for i := 0; i < nReduce; i++ {
 		filename := GetReduceFileName(i)
-		taskStatusMap[filename] = UnStarted
+		taskStatusMap[filename] = &TaskDetail{
+			TaskId:     i,
+			TaskStatus: UnStarted,
+			// 暂时不需要 UnGenerated 状态，worker 自动整合文件
+			// TaskStatus: UnGenerated,
+		}
 	}
 	return taskStatusMap
 }
@@ -77,7 +91,9 @@ func GetReduceFileName(index int) string {
 // the RPC argument and reply types are defined in rpc.go.
 //
 func (master *Master) ReplyTaskToWorker(args *TaskRequestArgs, reply *TaskReply) error {
-	file, taskType, ok := master.GetUnStartedTask()
+	file, taskType, taskId, ok := master.GetUnStartedTask()
+	reply.ReduceTaskNum = master.ReduceTaskNum
+	reply.TaskId = taskId
 	reply.File = file
 	reply.TaskType = taskType
 	reply.Ok = ok
@@ -91,13 +107,13 @@ func (master *Master) ReportFinishedTask(args *TaskFinishedArgs, reply *TaskFini
 	defer master.RWMux.Unlock()
 
 	if args.TaskType == MapTask {
-		master.MapTaskStatus[file] = Finished
+		master.MapTaskStatus[file].TaskStatus = Finished
 		reply.Ok = true
 		fmt.Printf("The Map task %v has finished\n", file)
 		go master.CheckMasterStatus()
 		return nil
 	} else if args.TaskType == ReduceTask {
-		master.ReduceTaskStatus[file] = Finished
+		master.ReduceTaskStatus[file].TaskStatus = Finished
 		reply.Ok = true
 		fmt.Printf("The Reduce task %v has finished\n", file)
 		go master.CheckMasterStatus()
@@ -135,7 +151,7 @@ func (master *Master) IsPhaseFinished(taskType TaskTypes) bool {
 	defer master.RWMux.RUnlock()
 	if taskType == MapTask {
 		for _, v := range master.MapTaskStatus {
-			if v == UnStarted || v == Processing {
+			if v.TaskStatus != Finished {
 				return false
 			}
 		}
@@ -143,7 +159,7 @@ func (master *Master) IsPhaseFinished(taskType TaskTypes) bool {
 	}
 	if taskType == ReduceTask {
 		for _, v := range master.ReduceTaskStatus {
-			if v == UnStarted || v == Processing {
+			if v.TaskStatus != Finished {
 				return false
 			}
 		}
@@ -166,51 +182,51 @@ func (master *Master) Done() bool {
 }
 
 // 从 map/reduce 任务中获取一个没有开始的任务
-func (master *Master) GetUnStartedTask() (string, TaskTypes, bool) {
+func (master *Master) GetUnStartedTask() (string, TaskTypes, int, bool) {
 	master.RWMux.Lock()
 	defer master.RWMux.Unlock()
 	if master.TaskStatus == MapTask {
-		for k, v := range master.MapTaskStatus {
-			if v == UnStarted {
-				master.MapTaskStatus[k] = Processing
-				go master.TimeOutDetection(k, MapTask)
-				return k, MapTask, true
+		for fileName, taskDetail := range master.MapTaskStatus {
+			if taskDetail.TaskStatus == UnStarted {
+				master.MapTaskStatus[fileName].TaskStatus = Processing
+				go master.TimeOutDetection(fileName, MapTask)
+				return fileName, MapTask, taskDetail.TaskId, true
 			}
 		}
-		return "", MapTask, false
+		return "", MapTask, 0, false
 	}
 	if master.TaskStatus == ReduceTask {
-		for k, v := range master.ReduceTaskStatus {
-			if v == UnStarted {
-				master.ReduceTaskStatus[k] = Processing
-				go master.TimeOutDetection(k, ReduceTask)
-				return k, ReduceTask, true
+		for fileName, taskDetail := range master.ReduceTaskStatus {
+			if taskDetail.TaskStatus == UnStarted {
+				master.ReduceTaskStatus[fileName].TaskStatus = Processing
+				go master.TimeOutDetection(fileName, ReduceTask)
+				return fileName, ReduceTask, taskDetail.TaskId, true
 			}
 		}
-		return "", ReduceTask, false
+		return "", ReduceTask, 0, false
 	}
-	return "", Free, false
+	return "", Free, 0, false
 }
 
 // 超时检测任务，如果 10s 后任务还是 processing 状态，就认为
 // worker 故障，直接将任务设为 UnStarted 状态
 //
 func (master *Master) TimeOutDetection(file string, taskType int) {
-	time.Sleep(10 * time.Second)
+	time.Sleep(5 * time.Second)
 	master.RWMux.Lock()
 	defer master.RWMux.Unlock()
 	if taskType == MapTask {
-		if master.MapTaskStatus[file] == Processing {
+		if master.MapTaskStatus[file].TaskStatus == Processing {
 			fmt.Printf("The worker of Map %v has faild", file)
-			master.MapTaskStatus[file] = UnStarted
+			master.MapTaskStatus[file].TaskStatus = UnStarted
 		}
 		return
 	}
 
 	if taskType == ReduceTask {
-		if master.ReduceTaskStatus[file] == Processing {
+		if master.ReduceTaskStatus[file].TaskStatus == Processing {
 			fmt.Printf("The worker of Reduce %v has faild", file)
-			master.ReduceTaskStatus[file] = UnStarted
+			master.ReduceTaskStatus[file].TaskStatus = UnStarted
 		}
 		return
 	}

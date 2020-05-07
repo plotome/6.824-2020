@@ -134,6 +134,7 @@ func (cfg *config) crash1(i int) {
 // this server. since we cannot really kill it.
 //
 func (cfg *config) start1(i int) {
+	_, _ = DPrintf("starting raft %d", i)
 	cfg.crash1(i)
 
 	// a fresh set of outgoing ClientEnd names.

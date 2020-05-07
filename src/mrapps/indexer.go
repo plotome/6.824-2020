@@ -17,8 +17,12 @@ import "sort"
 // In this framework, the key is the name of the file that is being processed,
 // and the value is the file's contents. The return value should be a slice of
 // key/value pairs, each represented by a mr.KeyValue.
+// 这个 mr-app 作用是将找出每一个单词出现在了哪些文件里，
+// 输出结果示例：abandon 2 ../pg-dorian_gray.txt,../pg-frankenstein.txt
 func Map(document string, value string) (res []mr.KeyValue) {
+	// 这个 m 好像并没有什么用处
 	m := make(map[string]bool)
+	// 将 string 分割成一组单词
 	words := strings.FieldsFunc(value, func(x rune) bool { return !unicode.IsLetter(x) })
 	for _, w := range words {
 		m[w] = true

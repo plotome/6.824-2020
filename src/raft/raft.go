@@ -56,7 +56,7 @@ type ApplyMsg struct {
 type LogEntry struct {
 	LogIndex int
 	LogTerm  int
-	command  interface{}
+	Command  interface{}
 }
 type RaftState int
 
@@ -86,13 +86,15 @@ type Raft struct {
 	votedFor       int
 	currentTerm    int
 	state          RaftState
+	applyCh        chan ApplyMsg
 	heartBeatTimer *time.Timer
 	electionTimer  *time.Timer
 	chs            RaftChans
 
-	log         []LogEntry
-	commitIndex int
-	lastApplied int
+	nextLogIndex int
+	logs         []LogEntry
+	commitIndex  int
+	lastApplied  int
 	// 选举后需要重新初始化
 	nextIndex  []int
 	matchIndex []int
@@ -101,10 +103,68 @@ type Raft struct {
 
 }
 
+func (rf *Raft) indexArrayInit() {
+
+	nextIndex := rf.getNextLogIndex()
+	// _, _ = DBPrintf("Leader %v, index array init, next index: %d, time: %v", rf.me, nextIndex, time.Now())
+
+	for i := range rf.peers {
+		rf.setNextIndex(i, nextIndex)
+
+		rf.matchIndex[i] = 0
+	}
+	//for i, _ := range rf.peers {
+	//	// 此处不能使用 rf.getNextIndex, 因为前面已经加锁了，这里会出现死锁！！！！
+	//	_, _ = DBPrintf("nextIndex[%d]: %v", i, rf.nextIndex[i])
+	//}
+
+}
+
+func (rf *Raft) getNextLogIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.nextLogIndex
+}
+
+func (rf *Raft) setNextLogIndex(idx int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.nextLogIndex = idx
+}
+func (rf *Raft) getCommitIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex
+}
+func (rf *Raft) setCommitIndex(idx int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.commitIndex = idx
+}
+func (rf *Raft) getLastApplied() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.lastApplied
+}
+func (rf *Raft) getNextIndex(peer int) int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.nextIndex[peer]
+}
+func (rf *Raft) setNextIndex(peer, idx int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.nextIndex[peer] = idx
+}
+func (rf *Raft) getMatchIndex(peer int) int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.matchIndex[peer]
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
@@ -170,6 +230,7 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 
+	LogEntries   []LogEntry
 	LeaderCommit int
 }
 
@@ -181,29 +242,80 @@ type AppendEntriesReply struct {
 // 添加日志，心跳检测
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	curTerm := rf.getCurrentTerm()
-	if args.IsHeartBeat {
-		// _, _ = DAPrintf("Follower %v: receive heart from leader %d", rf.me, args.LeaderId)
-		if args.Term < curTerm {
-			reply.Term = curTerm
-			reply.Success = false
-		} else if args.Term == curTerm {
-			rf.electionTimer.Reset(getRandElectionTimeout()) //重新计算选举时间
-			reply.Term = args.Term
-			reply.Success = true
-		} else if args.Term > curTerm {
-			// _, _ = DAPrintf("%v: find")
-			rf.becomeFollower(args.Term)
-			reply.Term = args.Term
-			curTerm = args.Term
-			reply.Success = true
+	if args.Term < curTerm { // 旧 Term 的信息
+		reply.Term = curTerm
+		reply.Success = false
+		return
+	}
+	if args.Term > curTerm { // 发现自己 Term 落后了，直接转为 Follower
+		// _, _ = DAPrintf("%v: find")
+		rf.becomeFollower(args.Term)
+		curTerm = args.Term
+	} else { // Term 一致，直接 reset 选举时钟
+		rf.electionTimer.Reset(getRandElectionTimeout()) //重新计算选举时间
+	}
+	reply.Term = args.Term
+
+	if args.IsHeartBeat { // 心跳检测
+		_, _ = DAPrintf("Follower %v: receive heart from leader %d", rf.me, args.LeaderId)
+		reply.Success = true
+		// commit？
+		oldCommitIndex := rf.getCommitIndex()
+		if args.LeaderCommit > oldCommitIndex {
+			// TODO: set commit index ?
+			newCommitIndex := min(rf.logs[len(rf.logs)-1].LogIndex, args.LeaderCommit)
+
+			_, _ = DBPrintf("Follower %v: change commit index to %d", rf.me, newCommitIndex)
+			go rf.followerCommit(oldCommitIndex, newCommitIndex)
+			rf.setCommitIndex(newCommitIndex)
 		}
-	} else {
+
+	} else { // 需要同步日志
 		// TODO: 完善添加日志的部分
-		if args.Term < curTerm {
-			reply.Term = curTerm
+		if args.PrevLogIndex > len(rf.logs)-1 { // 需要 leader 回退 PrevLogIndex
+			reply.Success = false
+		} else if rf.logs[args.PrevLogIndex].LogTerm == args.PrevLogTerm { // match
+			// 合并最新的 log entries
+			//_, _ = DBPrintf("Follower %v: receive new entry, ", rf.me)
+			rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.LogEntries[:]...)
+			_, _ = DBPrintf("Follower %v's logs up-to-date, logs' length: %d", rf.me, len(rf.logs))
+			_, _ = DBPrintf("Follower %v: next command %v", rf.me, rf.logs[args.PrevLogIndex+1].LogIndex)
+			reply.Success = true
+			oldCommitIndex := rf.getCommitIndex()
+			if args.LeaderCommit > oldCommitIndex {
+				// TODO: set commit index ?
+				newCommitIndex := min(rf.logs[len(rf.logs)-1].LogIndex, args.LeaderCommit)
+
+				_, _ = DBPrintf("Follower %v: change commit index to %d", rf.me, newCommitIndex)
+				go rf.followerCommit(oldCommitIndex, newCommitIndex)
+				rf.setCommitIndex(newCommitIndex)
+			}
+		} else { // not match
+			// follower log 回退，删除后面的不匹配的所有 log entries
+			rf.logs = rf.logs[:args.PrevLogIndex]
 			reply.Success = false
 		}
 	}
+}
+
+func (rf *Raft) followerCommit(startIndex, endIndex int) {
+	for idx := startIndex + 1; idx <= endIndex; idx++ {
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logs[idx].Command,
+			CommandIndex: idx,
+		}
+		// _, _ = DBPrintf("Follower %v: log command: %v", rf.me, applyMsg.Command)
+		_, _ = DBPrintf("Follower %v: log(%d) committed", rf.me, applyMsg.CommandIndex)
+		rf.applyCh <- applyMsg
+	}
+}
+
+func min(var1, var2 int) int {
+	if var1 < var2 {
+		return var1
+	}
+	return var2
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -238,7 +350,8 @@ type RequestVoteReply struct {
 // TODO: 该函数中容易出现 Data Race 的情况，需要加锁改进
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	_, _ = DAPrintf("%v received vote requested form %v", rf.me, args.CandidateId)
+	_, _ = DAPrintf("%v received vote requested form %v at term %v", rf.me, args.CandidateId, rf.getCurrentTerm())
+	_, _ = DAPrintf("%+v", args)
 	// Your code here (2A, 2B).
 	currentState := rf.getState()
 	// 发现自己不是最新的 Term
@@ -252,6 +365,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	// 候选人 Term 较小，或者当前服务器不是 Follower (Leader/Candidate)
 	if args.Term < rf.getCurrentTerm() || currentState != Follower {
+		_, _ = DAPrintf("Follower %v: candidate has old term %d, my term: %d", rf.me, args.Term, rf.getCurrentTerm())
 		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = false
 		return
@@ -259,6 +373,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Trem 一致，服务器为 Follower，且在本轮未参与投票，则为候选人投票
 	if rf.getVotedFor() != -1 { // 本轮已参与投票
+		_, _ = DAPrintf("Follower %v: voted at term", rf.me)
 		reply.Term = args.Term
 		reply.VoteGranted = false
 	} else { // TODO 根据 Candidate log 长度确定是否投票
@@ -266,6 +381,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = args.Term
 		reply.VoteGranted = true
 	}
+
+	rf.electionTimer.Reset(getRandElectionTimeout())
 }
 
 func (rf *Raft) getVotedFor() int {
@@ -330,8 +447,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !isLeader {
 		return -1, -1, isLeader
 	}
-	index := -1
+
+	// index 是 command 即将插入的下标
+	index := rf.getNextLogIndex()
 	term := rf.getCurrentTerm()
+	_, _ = DBPrintf("Leader %v: start a command at term %d, log index: %d", rf.me, term, index)
+	logEntry := LogEntry{
+		LogIndex: index,
+		LogTerm:  term,
+		Command:  command,
+	}
+	rf.logs = append(rf.logs[:index], logEntry)
+	rf.setNextLogIndex(index + 1)
 
 	return index, term, isLeader
 }
@@ -382,18 +509,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.applyCh = applyCh
 	rf.chs.chanGrantVote = make(chan int)
 	rf.chs.chanHeartBeat = make(chan int)
 
 	rf.setState(Follower)
 	rf.setVotedFor(-1)
 	rf.setCurrentTerm(0)
+	rf.setNextLogIndex(1)
+	rf.setCommitIndex(0)
 
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.indexArrayInit()
+	// 每个 Raft 节点都会初始化一个空日志，使得 commitIndex 从 0 开始
+	rf.logs = []LogEntry{{0, 0, nil}}
+	go rf.startCommitDetectionLoop()
 	go rf.startElectionLoop()
 	go rf.startHeartBeatLoop()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rand.Seed(time.Now().UnixNano())
 	return rf
 }
 
@@ -439,10 +578,11 @@ func (rf *Raft) setCurrentTerm(term int) {
 func (rf *Raft) becomeLeader() {
 	rf.setState(Leader)
 	rf.leaderId = rf.me
+	rf.indexArrayInit()
 	rf.persist()
 
 	// TODO
-	_, _ = DAPrintf("%v change to leader", rf.me)
+	_, _ = DBPrintf("%v change to leader", rf.me)
 }
 
 // 成为 Candidate 后向所有 Follower 拉票
@@ -475,11 +615,12 @@ func (rf *Raft) startElection() {
 					_, _ = DAPrintf("Candidate %v: rpc to %d failed", rf.me, i)
 					return
 				}
-				// _, _ = DAPrintf("reply from %v: %+v", i, reply)
+				_, _ = DAPrintf("reply from %v: %+v", i, reply)
 				if reply.VoteGranted == true {
 					_, _ = DAPrintf("Candidate %v: follower %d voted me", rf.me, i)
 					mu.Lock()
 					voteNum++
+					_, _ = DAPrintf("Candidate %v: voteNum: %d", rf.me, voteNum)
 					mu.Unlock()
 				} else if reply.Term > rf.getCurrentTerm() {
 					_, _ = DAPrintf("Candidate %v: current term is not up-to-date, higher term: %d", rf.me, reply.Term)
@@ -491,6 +632,7 @@ func (rf *Raft) startElection() {
 	// 如果已经过了轮次，或者自己已经不是 Candidate ，则直接退出程序，
 	for rf.isStartTermAndState(startTerm) {
 		mu.Lock()
+		// _, _ = DAPrintf("test, voteNum: %v, peerNum/2: %v", voteNum, peerNum/2)
 		if voteNum > peerNum/2 {
 			mu.Unlock()
 			rf.becomeLeader()
@@ -500,8 +642,8 @@ func (rf *Raft) startElection() {
 		time.Sleep(20 * time.Millisecond)
 	}
 	// 等待所有协程工作完毕，避免出现意外问题
-	wg.Wait()
 	_, _ = DAPrintf("Raft %v: term %d election finished", rf.me, startTerm)
+	wg.Wait()
 }
 
 // 判断当前 Term 是否为选举开始时的 Term，如果不是，表明进入了下一轮，
@@ -553,7 +695,7 @@ func (rf *Raft) startElectionLoop() {
 
 // 开始一轮心跳检测
 func (rf *Raft) startHeartBeat() {
-	// _, _ = DAPrintf("Leader %v: start heartbeat at term %d", rf.me, rf.getCurrentTerm())
+	_, _ = DAPrintf("Leader %v: start heartbeat at term %d", rf.me, rf.getCurrentTerm())
 	me := rf.me
 	curTerm := rf.getCurrentTerm()
 	// TODO：append entries？
@@ -561,29 +703,125 @@ func (rf *Raft) startHeartBeat() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != me {
 			wg.Add(1)
-			go func(i int, wg *sync.WaitGroup) { // 开启协程，单独执行心跳检测
-				defer wg.Done()
-				args := AppendEntriesArgs{
-					IsHeartBeat: true,
-					Term:        curTerm,
-					LeaderId:    me,
-				}
-				reply := AppendEntriesReply{}
-				_, _ = DAPrintf("Leader %v: send heartbeat at term %d to %d", rf.me, rf.getCurrentTerm(), i)
-				rf.sendAppendEntries(i, &args, &reply)
-				if rf.getState() != Leader { // 不是 leader 则直接退出，不管返回值
-					return
-				}
-				if reply.Success == true {
-					// _, _ = DAPrintf("Leader %v: follower %d received heartbeat from leader %d", rf.me, i, args.LeaderId)
-				} else if reply.Term > rf.getCurrentTerm() {
-					_, _ = DAPrintf("Leader %v: current term is not up-to-date, higher term: %d", rf.me, reply.Term)
-					rf.becomeFollower(reply.Term)
-				}
-			}(i, &wg)
+			if rf.matchIndex[i] == rf.getNextLogIndex()-1 {
+				go rf.justHeartBeat(curTerm, i, &wg)
+			} else {
+				go rf.sendLogEntries(i, &wg)
+			}
+
 		}
 	}
 	wg.Wait()
+}
+
+// 在循环里检测某条信息是否可以 commit
+func (rf *Raft) startCommitDetectionLoop() {
+	for {
+		time.Sleep(10 * time.Millisecond)
+		if rf.getState() != Leader { // 不是 Leader 就跳过「本次」循环（千万别用 break！）
+			continue
+		}
+		// 下一个应该被 commit 的 log index
+		nextCommitIndex := rf.getCommitIndex() + 1
+		// _, _= DBPrintf("nextCommitIndex: %d", nextCommitIndex)
+		commitCount := 1
+		if nextCommitIndex < rf.getNextLogIndex() {
+			for idx, matchIndex := range rf.matchIndex {
+				if idx != rf.me && matchIndex >= nextCommitIndex {
+					_, _ = DBPrintf("Leader %v: Follower %d match current index(index: %d)", rf.me, idx, matchIndex)
+					commitCount++
+				}
+			}
+		}
+		if commitCount > len(rf.peers)/2 {
+			rf.setCommitIndex(nextCommitIndex)
+			_, _ = DBPrintf("Leader %v: log(index: %d) committed, next commit index: %d", rf.me, nextCommitIndex, rf.getCommitIndex())
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[nextCommitIndex].Command,
+				CommandIndex: nextCommitIndex,
+			}
+			//_, _ = DBPrintf("Leader %v: log command: %v", rf.me, applyMsg.Command)
+			_, _ = DBPrintf("Leader %v: log(%d) committed", rf.me, applyMsg.CommandIndex)
+			rf.applyCh <- applyMsg
+		}
+	}
+}
+
+// 对没有到达最新状态的节点，发送日志
+func (rf *Raft) sendLogEntries(peer int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if rf.getState() != Leader {
+		return
+	}
+	prevLogIndex := rf.getNextIndex(peer) - 1
+	matchIndex := len(rf.logs) - 1
+	_, _ = DBPrintf("prevLogIndex: %d, matchIndex: %d", prevLogIndex, matchIndex)
+	args := AppendEntriesArgs{
+		IsHeartBeat: false,
+		Term:        rf.getCurrentTerm(),
+		LeaderId:    rf.me,
+		// 让 follower 利用 PrevLogIndex 和 PrevLogTerm 判断之前的 logs 是否已经 up-to-date
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  rf.logs[prevLogIndex].LogTerm,
+		LogEntries:   rf.logs[rf.getNextIndex(peer):],
+		LeaderCommit: rf.getCommitIndex(),
+	}
+	reply := AppendEntriesReply{}
+	_, _ = DBPrintf("Leader %v: send log entries to %d at term %d", rf.me, peer, args.Term)
+	ok := rf.sendAppendEntries(peer, &args, &reply)
+	if !ok {
+		_, _ = DBPrintf("Leader %v: send log entries to %d at term %d filed, timeout", rf.me, peer, args.Term)
+		return
+	}
+	if rf.getState() != Leader { // 不是 leader 则直接退出，不管返回值
+		return
+	}
+	if reply.Success == true { // follower 接受了 log entries
+		_, _ = DBPrintf("Leader %v: follower %d received log entries from leader %d, match index: %d", rf.me, peer, args.LeaderId, matchIndex)
+		rf.matchIndex[peer] = matchIndex
+		// 及时更新 nextIndex，以降低 RPC 的网络消耗
+		rf.nextIndex[peer] = matchIndex + 1
+	} else if reply.Term > rf.getCurrentTerm() { // 发现自己落后了，转成 follower
+		_, _ = DBPrintf("Leader %v: current term is not up-to-date, higher term: %d", rf.me, reply.Term)
+		rf.becomeFollower(reply.Term)
+
+	} else if reply.Term == rf.getCurrentTerm() { // 在同一选举周期，PrevLogIndex 或 PrevLogTerm 不一致
+		_, _ = DBPrintf("Leader %v: PrevLogIndex(%d) and PrevLogTerm(%d) are not consistent", rf.me, args.PrevLogIndex, args.PrevLogTerm)
+		// rf.nextIndex[peer] 回退 TODO：回退间隔可以设置的大一些
+		rf.setNextIndex(peer, rf.getNextIndex(peer)-1)
+
+	}
+}
+
+// 对于已经 up-to-date 的 follower 发送心跳检测即可
+func (rf *Raft) justHeartBeat(curTerm int, peer int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if rf.getState() != Leader {
+		return
+	}
+	prevLogIndex := rf.getNextIndex(peer) - 1
+	// _, _ = DBPrintf("Leader %v, prevLogIndex: %d, peer: %d, time: %v", rf.me, prevLogIndex, peer, time.Now())
+	args := AppendEntriesArgs{
+		IsHeartBeat:  true,
+		Term:         curTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  rf.logs[prevLogIndex].LogTerm,
+		LeaderCommit: rf.getCommitIndex(),
+	}
+	reply := AppendEntriesReply{}
+	_, _ = DAPrintf("Leader %v: send heartbeat to %d at term %d", rf.me, peer, rf.getCurrentTerm())
+	rf.sendAppendEntries(peer, &args, &reply)
+	if rf.getState() != Leader { // 不是 leader 则直接退出，不管返回值
+		return
+	}
+	if reply.Success == true {
+		// _, _ = DAPrintf("Leader %v: follower %d received heartbeat from leader %d", rf.me, peer, args.LeaderId)
+	} else if reply.Term > rf.getCurrentTerm() {
+		_, _ = DAPrintf("Leader %v: current term is not up-to-date, higher term: %d", rf.me, reply.Term)
+		rf.becomeFollower(reply.Term)
+	}
 }
 
 // 负责心跳任务的 GoRoutine
@@ -615,14 +853,17 @@ func getHeartBeatTimeout() time.Duration {
 
 const (
 	ElectionTimeoutMin time.Duration = 200
-	ElectionTimeoutMax time.Duration = 300
+	ElectionTimeoutMax time.Duration = 400
 )
 
 // 获取随机的选举 TimeOut
+var randMutex = sync.Mutex{}
+
 func getRandElectionTimeout() time.Duration {
-	rand.Seed(time.Now().UnixNano())
+	randMutex.Lock()
+	defer randMutex.Unlock()
 	timeoutInterval := int(ElectionTimeoutMax - ElectionTimeoutMin)
 	t := ElectionTimeoutMin + time.Duration(rand.Intn(timeoutInterval+1))
-	// DAPrintf("new election time out: %d Millisecond", t)
+	_, _ = DAPrintf("new election time out: %d Millisecond", t)
 	return t * time.Millisecond
 }

@@ -267,19 +267,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 			_, _ = DBPrintf("Follower %v: change commit index to %d", rf.me, newCommitIndex)
 			go rf.followerCommit(oldCommitIndex, newCommitIndex)
-			rf.setCommitIndex(newCommitIndex)
 		}
 
 	} else { // 需要同步日志
 		// TODO: 完善添加日志的部分
-		if args.PrevLogIndex > len(rf.logs)-1 { // 需要 leader 回退 PrevLogIndex
+		if args.PrevLogIndex > len(rf.logs)-1 { // 需要 leader 回退 follower's PrevLogIndex
 			reply.Success = false
 		} else if rf.logs[args.PrevLogIndex].LogTerm == args.PrevLogTerm { // match
 			// 合并最新的 log entries
 			//_, _ = DBPrintf("Follower %v: receive new entry, ", rf.me)
 			rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.LogEntries[:]...)
-			_, _ = DBPrintf("Follower %v's logs up-to-date, logs' length: %d", rf.me, len(rf.logs))
-			_, _ = DBPrintf("Follower %v: next command %v", rf.me, rf.logs[args.PrevLogIndex+1].LogIndex)
+			// 修改 raft nextLogIndex，以免投票时出错
+			rf.setNextLogIndex(len(rf.logs))
+			_, _ = DBPrintf("Follower %v's logs up-to-date, logs' length: %d, args: %+v", rf.me, len(rf.logs), args)
+			_, _ = DBPrintf("Follower %v: next command %v", rf.me, rf.logs[rf.getNextLogIndex()-1].LogIndex)
 			reply.Success = true
 			oldCommitIndex := rf.getCommitIndex()
 			if args.LeaderCommit > oldCommitIndex {
@@ -288,17 +289,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 				_, _ = DBPrintf("Follower %v: change commit index to %d", rf.me, newCommitIndex)
 				go rf.followerCommit(oldCommitIndex, newCommitIndex)
-				rf.setCommitIndex(newCommitIndex)
 			}
 		} else { // not match
 			// follower log 回退，删除后面的不匹配的所有 log entries
 			rf.logs = rf.logs[:args.PrevLogIndex]
+			rf.setNextLogIndex(args.PrevLogIndex + 1)
 			reply.Success = false
 		}
 	}
 }
 
 func (rf *Raft) followerCommit(startIndex, endIndex int) {
+	rf.setCommitIndex(endIndex)
 	for idx := startIndex + 1; idx <= endIndex; idx++ {
 		applyMsg := ApplyMsg{
 			CommandValid: true,
@@ -345,27 +347,41 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+func isCandidateUpToDate(curTerm, curIndex int, candidateTerm, candidateIndex int) bool {
+	_, _ = DBPrintf("curTerm: %d, curIndex: %d, candidateTerm: %d, candidateIndex: %d", curTerm, curIndex, candidateTerm, candidateIndex)
+	if candidateTerm != curTerm {
+		return candidateTerm > curTerm
+	}
+	return candidateIndex >= curIndex
+}
+
 //
 // example RequestVote RPC handler.\
-// TODO: 该函数中容易出现 Data Race 的情况，需要加锁改进
+// Done: 该函数中容易出现 Data Race 的情况，需要加锁改进
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	_, _ = DAPrintf("%v received vote requested form %v at term %v", rf.me, args.CandidateId, rf.getCurrentTerm())
 	_, _ = DAPrintf("%+v", args)
 	// Your code here (2A, 2B).
 	currentState := rf.getState()
+	reply.VoteGranted = false
 	// 发现自己不是最新的 Term
 	if args.Term > rf.getCurrentTerm() {
 		rf.becomeFollower(args.Term)
-		rf.setVotedFor(args.CandidateId)
-		_, _ = DAPrintf("Follower %v: vote for candidate %d", rf.me, args.CandidateId)
-		reply.Term = args.Term
-		reply.VoteGranted = true
-		return
+		// rf.setVotedFor(args.CandidateId)
+		_, _ = DBPrintf("Follower %v: find higher term from candidate %d, current term: %d", rf.me, args.CandidateId, args.Term)
+		// reply.Term = args.Term
+		// reply.VoteGranted = true
+		// return
 	}
 	// 候选人 Term 较小，或者当前服务器不是 Follower (Leader/Candidate)
 	if args.Term < rf.getCurrentTerm() || currentState != Follower {
-		_, _ = DAPrintf("Follower %v: candidate has old term %d, my term: %d", rf.me, args.Term, rf.getCurrentTerm())
+		if currentState != Follower {
+			_, _ = DAPrintf("Follower %v: became Candidate/Leader before, not vote for candidate(%d)", rf.me, args.CandidateId)
+		} else {
+			_, _ = DAPrintf("Follower %v: candidate(%d) has old term %d, my term: %d", rf.me, args.CandidateId, args.Term, rf.getCurrentTerm())
+		}
+
 		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = false
 		return
@@ -373,13 +389,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// Trem 一致，服务器为 Follower，且在本轮未参与投票，则为候选人投票
 	if rf.getVotedFor() != -1 { // 本轮已参与投票
-		_, _ = DAPrintf("Follower %v: voted at term", rf.me)
+		_, _ = DAPrintf("Follower %v: voted at this term earlier", rf.me)
 		reply.Term = args.Term
 		reply.VoteGranted = false
 	} else { // TODO 根据 Candidate log 长度确定是否投票
-		rf.votedFor = args.CandidateId
-		reply.Term = args.Term
-		reply.VoteGranted = true
+		curTerm := rf.getNextLogIndex() - 1
+		curIndex := rf.logs[curTerm].LogIndex
+		// 需要判断 candidate 日志是否 up-to-date
+		// 此处要加函数级别的锁，避免多线程同时判断并修改 rf.votedFor
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if isCandidateUpToDate(curTerm, curIndex, args.LastLogTerm, args.LastLogIndex) {
+			_, _ = DBPrintf("Follower %v: candidate %d's log is least as up-to-date, vote him, %+v, my term: %d, my index: %d", rf.me, args.CandidateId, args, curTerm, curIndex)
+			rf.votedFor = args.CandidateId
+			reply.Term = args.Term
+			reply.VoteGranted = true
+		} else {
+			_, _ = DBPrintf("Follower %v: candidate %d's log is not least as up-to-date", rf.me, args.CandidateId)
+			reply.Term = args.Term
+			reply.VoteGranted = false
+		}
+
 	}
 
 	rf.electionTimer.Reset(getRandElectionTimeout())
@@ -582,7 +612,7 @@ func (rf *Raft) becomeLeader() {
 	rf.persist()
 
 	// TODO
-	_, _ = DBPrintf("%v change to leader", rf.me)
+	_, _ = DAPrintf("%v change to leader", rf.me)
 }
 
 // 成为 Candidate 后向所有 Follower 拉票
@@ -604,8 +634,10 @@ func (rf *Raft) startElection() {
 			go func(i int, wg *sync.WaitGroup) { // 开启协程，单独执行拉票程序
 				defer wg.Done()
 				args := RequestVoteArgs{
-					Term:        rf.getCurrentTerm(),
-					CandidateId: rf.me,
+					Term:         rf.getCurrentTerm(),
+					CandidateId:  rf.me,
+					LastLogIndex: rf.getCommitIndex(),
+					LastLogTerm:  rf.logs[rf.getCommitIndex()].LogTerm,
 				}
 				reply := RequestVoteReply{}
 				// _, _ = DAPrintf("%v: request vote from %d", rf.me, i)

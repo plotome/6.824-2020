@@ -76,6 +76,7 @@ type RaftChans struct {
 //
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	funcMu    sync.Mutex          // 函数级别的锁
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -111,7 +112,7 @@ func (rf *Raft) indexArrayInit() {
 	for i := range rf.peers {
 		rf.setNextIndex(i, nextIndex)
 
-		rf.matchIndex[i] = 0
+		rf.setMatchIndex(i, 0)
 	}
 	//for i, _ := range rf.peers {
 	//	// 此处不能使用 rf.getNextIndex, 因为前面已经加锁了，这里会出现死锁！！！！
@@ -151,10 +152,23 @@ func (rf *Raft) getNextIndex(peer int) int {
 	defer rf.mu.Unlock()
 	return rf.nextIndex[peer]
 }
+
 func (rf *Raft) setNextIndex(peer, idx int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if idx <= 0 {
+		idx = 1
+	}
 	rf.nextIndex[peer] = idx
+}
+
+func (rf *Raft) setMatchIndex(peer, idx int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if idx < 0 {
+		idx = 0
+	}
+	rf.matchIndex[peer] = idx
 }
 func (rf *Raft) getMatchIndex(peer int) int {
 	rf.mu.Lock()
@@ -248,14 +262,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	if args.Term > curTerm { // 发现自己 Term 落后了，直接转为 Follower
-		// _, _ = DAPrintf("%v: find")
+		_, _ = DBPrintf("%v: term is not up-to-date, new term: %v", rf.me, args.Term)
 		rf.becomeFollower(args.Term)
 		curTerm = args.Term
 	} else { // Term 一致，直接 reset 选举时钟
 		rf.electionTimer.Reset(getRandElectionTimeout()) //重新计算选举时间
 	}
-	reply.Term = args.Term
 
+	reply.Term = rf.getCurrentTerm()
 	if args.IsHeartBeat { // 心跳检测
 		_, _ = DAPrintf("Follower %v: receive heart from leader %d", rf.me, args.LeaderId)
 		reply.Success = true
@@ -271,7 +285,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	} else { // 需要同步日志
 		// TODO: 完善添加日志的部分
-		if args.PrevLogIndex > len(rf.logs)-1 { // 需要 leader 回退 follower's PrevLogIndex
+		_, _ = DBPrintf("Follower %v: receive entries from leader %d, args: %+v", rf.me, args.LeaderId, args)
+		if args.PrevLogIndex > len(rf.logs)-1 || args.PrevLogIndex < rf.getCommitIndex() { // 需要 leader 回退 follower's PrevLogIndex
 			reply.Success = false
 		} else if rf.logs[args.PrevLogIndex].LogTerm == args.PrevLogTerm { // match
 			// 合并最新的 log entries
@@ -348,7 +363,7 @@ type RequestVoteReply struct {
 }
 
 func isCandidateUpToDate(curTerm, curIndex int, candidateTerm, candidateIndex int) bool {
-	_, _ = DBPrintf("curTerm: %d, curIndex: %d, candidateTerm: %d, candidateIndex: %d", curTerm, curIndex, candidateTerm, candidateIndex)
+	_, _ = DBPrintf("myLastLogTerm: %d, myLastLogIndex: %d, candidateLastLogTerm: %d, candidateLastLogIndex: %d", curTerm, curIndex, candidateTerm, candidateIndex)
 	if candidateTerm != curTerm {
 		return candidateTerm > curTerm
 	}
@@ -388,20 +403,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// Trem 一致，服务器为 Follower，且在本轮未参与投票，则为候选人投票
+	// 此处要加函数级别的锁，避免多线程同时判断并修改 rf.votedFor !!!
+	// rf.getVotedFor() != -1 这个判断语句与 isCandidateUpToDate() 应该放在一起
+	rf.funcMu.Lock()
+	defer rf.funcMu.Unlock()
 	if rf.getVotedFor() != -1 { // 本轮已参与投票
 		_, _ = DAPrintf("Follower %v: voted at this term earlier", rf.me)
 		reply.Term = args.Term
 		reply.VoteGranted = false
-	} else { // TODO 根据 Candidate log 长度确定是否投票
-		curTerm := rf.getNextLogIndex() - 1
-		curIndex := rf.logs[curTerm].LogIndex
+	} else { // Done 根据 Candidate log 长度确定是否投票
+		// 注意这里的 myLastLogIndex 和 myLastLogTerm，需据此确定是否给 candidate 投票
+		// 这里写错了的话，出现 Leader 分区后重新加入的情况会很麻烦
+		myLastLogIndex := rf.getNextLogIndex() - 1
+		myLastLogTerm := rf.logs[myLastLogIndex].LogTerm
 		// 需要判断 candidate 日志是否 up-to-date
-		// 此处要加函数级别的锁，避免多线程同时判断并修改 rf.votedFor
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		if isCandidateUpToDate(curTerm, curIndex, args.LastLogTerm, args.LastLogIndex) {
-			_, _ = DBPrintf("Follower %v: candidate %d's log is least as up-to-date, vote him, %+v, my term: %d, my index: %d", rf.me, args.CandidateId, args, curTerm, curIndex)
-			rf.votedFor = args.CandidateId
+		if isCandidateUpToDate(myLastLogTerm, myLastLogIndex, args.LastLogTerm, args.LastLogIndex) {
+			_, _ = DBPrintf("Follower %v: candidate %d's log is least as up-to-date, vote him, %+v, myLastLogTerm: %d, myLastLogIndex: %d", rf.me, args.CandidateId, args, myLastLogTerm, myLastLogIndex)
+			rf.setVotedFor(args.CandidateId)
 			reply.Term = args.Term
 			reply.VoteGranted = true
 		} else {
@@ -471,6 +489,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	// 函数加锁，避免并发时出现问题
+	rf.funcMu.Lock()
+	defer rf.funcMu.Unlock()
 
 	isLeader := rf.getState() == Leader
 	// Your code here (2B).
@@ -633,11 +654,12 @@ func (rf *Raft) startElection() {
 			wg.Add(1)
 			go func(i int, wg *sync.WaitGroup) { // 开启协程，单独执行拉票程序
 				defer wg.Done()
+				lastLogIndex := rf.getNextLogIndex() - 1
 				args := RequestVoteArgs{
 					Term:         rf.getCurrentTerm(),
 					CandidateId:  rf.me,
-					LastLogIndex: rf.getCommitIndex(),
-					LastLogTerm:  rf.logs[rf.getCommitIndex()].LogTerm,
+					LastLogIndex: lastLogIndex,
+					LastLogTerm:  rf.logs[lastLogIndex].LogTerm,
 				}
 				reply := RequestVoteReply{}
 				// _, _ = DAPrintf("%v: request vote from %d", rf.me, i)
@@ -735,7 +757,7 @@ func (rf *Raft) startHeartBeat() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != me {
 			wg.Add(1)
-			if rf.matchIndex[i] == rf.getNextLogIndex()-1 {
+			if rf.getMatchIndex(i) == rf.getNextLogIndex()-1 {
 				go rf.justHeartBeat(curTerm, i, &wg)
 			} else {
 				go rf.sendLogEntries(i, &wg)
@@ -758,7 +780,9 @@ func (rf *Raft) startCommitDetectionLoop() {
 		// _, _= DBPrintf("nextCommitIndex: %d", nextCommitIndex)
 		commitCount := 1
 		if nextCommitIndex < rf.getNextLogIndex() {
-			for idx, matchIndex := range rf.matchIndex {
+			peerNum := len(rf.peers)
+			for idx := 0; idx < peerNum; idx++ {
+				matchIndex := rf.getMatchIndex(idx)
 				if idx != rf.me && matchIndex >= nextCommitIndex {
 					_, _ = DBPrintf("Leader %v: Follower %d match current index(index: %d)", rf.me, idx, matchIndex)
 					commitCount++
@@ -789,6 +813,10 @@ func (rf *Raft) sendLogEntries(peer int, wg *sync.WaitGroup) {
 	prevLogIndex := rf.getNextIndex(peer) - 1
 	matchIndex := len(rf.logs) - 1
 	_, _ = DBPrintf("prevLogIndex: %d, matchIndex: %d", prevLogIndex, matchIndex)
+	// use deep copy to avoid race condition
+	// when override log in AppendEntries()
+	entries := make([]LogEntry, len(rf.logs[prevLogIndex+1:]))
+	copy(entries, rf.logs[prevLogIndex+1:])
 	args := AppendEntriesArgs{
 		IsHeartBeat: false,
 		Term:        rf.getCurrentTerm(),
@@ -800,10 +828,10 @@ func (rf *Raft) sendLogEntries(peer int, wg *sync.WaitGroup) {
 		LeaderCommit: rf.getCommitIndex(),
 	}
 	reply := AppendEntriesReply{}
-	_, _ = DBPrintf("Leader %v: send log entries to %d at term %d", rf.me, peer, args.Term)
+	_, _ = DBPrintf("Leader %v: send log entries to %d at term %d, args: %+v", rf.me, peer, args.Term, args)
 	ok := rf.sendAppendEntries(peer, &args, &reply)
 	if !ok {
-		_, _ = DBPrintf("Leader %v: send log entries to %d at term %d filed, timeout", rf.me, peer, args.Term)
+		_, _ = DBPrintf("Leader %v: send log entries to %d at term %d filed, timeout, args: %+v", rf.me, peer, args.Term, args)
 		return
 	}
 	if rf.getState() != Leader { // 不是 leader 则直接退出，不管返回值
@@ -811,14 +839,16 @@ func (rf *Raft) sendLogEntries(peer int, wg *sync.WaitGroup) {
 	}
 	if reply.Success == true { // follower 接受了 log entries
 		_, _ = DBPrintf("Leader %v: follower %d received log entries from leader %d, match index: %d", rf.me, peer, args.LeaderId, matchIndex)
-		rf.matchIndex[peer] = matchIndex
+		rf.setMatchIndex(peer, matchIndex)
 		// 及时更新 nextIndex，以降低 RPC 的网络消耗
-		rf.nextIndex[peer] = matchIndex + 1
+		rf.setNextIndex(peer, matchIndex+1)
 	} else if reply.Term > rf.getCurrentTerm() { // 发现自己落后了，转成 follower
 		_, _ = DBPrintf("Leader %v: current term is not up-to-date, higher term: %d", rf.me, reply.Term)
 		rf.becomeFollower(reply.Term)
 
-	} else if reply.Term == rf.getCurrentTerm() { // 在同一选举周期，PrevLogIndex 或 PrevLogTerm 不一致
+	} else if reply.Term == rf.getCurrentTerm() {
+		// 在同一选举周期，PrevLogIndex 或 PrevLogTerm 不一致
+		// 或者 leader 的 commit 信息落后于 follower
 		_, _ = DBPrintf("Leader %v: PrevLogIndex(%d) and PrevLogTerm(%d) are not consistent", rf.me, args.PrevLogIndex, args.PrevLogTerm)
 		// rf.nextIndex[peer] 回退 TODO：回退间隔可以设置的大一些
 		rf.setNextIndex(peer, rf.getNextIndex(peer)-1)
@@ -844,7 +874,10 @@ func (rf *Raft) justHeartBeat(curTerm int, peer int, wg *sync.WaitGroup) {
 	}
 	reply := AppendEntriesReply{}
 	_, _ = DAPrintf("Leader %v: send heartbeat to %d at term %d", rf.me, peer, rf.getCurrentTerm())
-	rf.sendAppendEntries(peer, &args, &reply)
+	ok := rf.sendAppendEntries(peer, &args, &reply)
+	if !ok {
+		_, _ = DAPrintf("Leader %v: send heartbeat to %d at term %d filed, timeout", rf.me, peer, rf.getCurrentTerm())
+	}
 	if rf.getState() != Leader { // 不是 leader 则直接退出，不管返回值
 		return
 	}

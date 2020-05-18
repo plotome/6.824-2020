@@ -266,6 +266,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// accelerated log backtracking optimization
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // 添加日志，心跳检测
@@ -308,8 +312,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// if args.PrevLogIndex > len(rf.logs)-1 || args.PrevLogIndex < rf.getCommitIndex() { // 需要 leader 回退 follower's PrevLogIndex
 		if args.PrevLogIndex > len(rf.logs)-1 { // 需要 leader 回退 follower's PrevLogIndex
 			_, _ = DBPrintf("Follower %v: args.PrevLogIndex(%d) are too larger, len(rf.logs)-1: %d, myCommitIndex: %d", rf.me, args.PrevLogIndex, len(rf.logs)-1, rf.getCommitIndex())
+			// follower does not have prevLogIndex in its log
+			reply.ConflictIndex = len(rf.logs)
+			reply.ConflictTerm = -1
 			reply.Success = false
-		} else if args.PrevLogIndex < rf.getCommitIndex() { //prevIndex 小于当前 commit index
+			//} else if args.PrevLogIndex < rf.getCommitIndex() { //prevIndex 小于当前 commit index, 应该不会发生这种情况
 
 		} else if rf.logs[args.PrevLogIndex].LogTerm == args.PrevLogTerm { // match
 			// 合并最新的 log entries
@@ -330,13 +337,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				go rf.followerCommit(oldCommitIndex, newCommitIndex)
 				// rf.setCommitIndex(newCommitIndex)
 			}
-		} else { // not match
+		} else { // term not match
+			reply.ConflictTerm = rf.logs[args.PrevLogIndex].LogTerm
+			conflictIndex := args.PrevLogIndex
+			// apparently, since rf.logs[0] are ensured to match among all servers
+			// ConflictIndex must be > 0, safe to minus 1
+			for rf.logs[conflictIndex-1].LogTerm == reply.ConflictTerm {
+				conflictIndex--
+			}
+			reply.ConflictIndex = conflictIndex
+			reply.Success = false
+
 			// follower log 回退，删除后面的不匹配的所有 log entries
 			rf.logs = rf.logs[:args.PrevLogIndex]
 			// rf.setNextLogIndex(args.PrevLogIndex + 1)
 			rf.setNextLogIndex(len(rf.logs))
-			reply.Success = false
-
 		}
 	}
 	go rf.persist()
@@ -814,34 +829,50 @@ func (rf *Raft) startCommitDetectionLoop() {
 		}
 		// 下一个应该被 commit 的 log index
 		nextCommitIndex := rf.getCommitIndex() + 1
+		// 最后一个需要 commit 的 log
+		lastCommitIndex := nextCommitIndex
 		// _, _= DBPrintf("nextCommitIndex: %d", nextCommitIndex)
-		commitCount := 1
-		if nextCommitIndex < rf.getNextLogIndex() {
+		for lastCommitIndex < rf.getNextLogIndex() {
+			commitCount := 1
 			peerNum := len(rf.peers)
 			for idx := 0; idx < peerNum; idx++ {
 				matchIndex := rf.getMatchIndex(idx)
-				if idx != rf.me && matchIndex >= nextCommitIndex {
+				if idx != rf.me && matchIndex >= lastCommitIndex {
 					_, _ = DBPrintf("Leader %v: Follower %d match current index(index: %d)", rf.me, idx, matchIndex)
 					commitCount++
 				}
 			}
-		}
-		if commitCount > len(rf.peers)/2 {
-			rf.funcMu.Lock()
-			rf.setCommitIndex(nextCommitIndex)
-			go rf.persist()
-			_, _ = DBPrintf("Leader %v: log(index: %d) committed, next commit index: %d", rf.me, nextCommitIndex, rf.getCommitIndex()+1)
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.logs[nextCommitIndex].Command,
-				CommandIndex: nextCommitIndex,
+			if commitCount > peerNum/2 {
+				lastCommitIndex++
+				continue
 			}
-			rf.funcMu.Unlock()
-			//_, _ = DBPrintf("Leader %v: log command: %v", rf.me, applyMsg.Command)
-			_, _ = DBPrintf("Leader %v: log(%d) committed", rf.me, applyMsg.CommandIndex)
-			rf.applyCh <- applyMsg
+			break
+		}
+		lastCommitIndex--
+		// 论文 5.4.2 小节的要求，只有最后一个需要提交的 log term 为当前轮次，才可以提交
+		// 详见论文 Figure 8 所示情景
+		if rf.logs[lastCommitIndex].LogTerm == rf.getCurrentTerm() {
+			for idx := nextCommitIndex; idx <= lastCommitIndex; idx++ {
+				rf.setCommitIndex(idx)
+				rf.commitLogToClient(idx)
+			}
+			go rf.persist()
 		}
 	}
+}
+
+func (rf *Raft) commitLogToClient(nextCommitIndex int) {
+	rf.funcMu.Lock()
+	_, _ = DBPrintf("Leader %v: log(index: %d) committed, next commit index: %d", rf.me, nextCommitIndex, rf.getCommitIndex()+1)
+	applyMsg := ApplyMsg{
+		CommandValid: true,
+		Command:      rf.logs[nextCommitIndex].Command,
+		CommandIndex: nextCommitIndex,
+	}
+	rf.funcMu.Unlock()
+	//_, _ = DBPrintf("Leader %v: log command: %v", rf.me, applyMsg.Command)
+	_, _ = DBPrintf("Leader %v: log(%d) committed", rf.me, applyMsg.CommandIndex)
+	rf.applyCh <- applyMsg
 }
 
 // 对没有到达最新状态的节点，发送日志
@@ -895,11 +926,21 @@ func (rf *Raft) sendLogEntries(curTerm, peer int, wg *sync.WaitGroup) {
 
 	} else if reply.Term == curTerm {
 		// 在同一选举周期，PrevLogIndex 或 PrevLogTerm 不一致
-		// 或者 leader 的 commit 信息落后于 follower
+		// 或者 leader 的 commit 信息落后于 follower <- 应该不会发生
 		_, _ = DBPrintf("Leader %v: PrevLogIndex(%d) and PrevLogTerm(%d) are not consistent with peer %d", rf.me, args.PrevLogIndex, args.PrevLogTerm, peer)
-		// rf.nextIndex[peer] 回退 TODO：回退间隔可以设置的大一些
-		rf.setNextIndex(peer, rf.getNextIndex(peer)-1)
-
+		// rf.nextIndex[peer] 回退， Done：回退优化（Students' Guide to Raft）
+		if reply.ConflictTerm == -1 { //follower does not have prevLogIndex in its log
+			rf.setNextIndex(peer, reply.ConflictIndex)
+		} else { //follower does have prevLogIndex in its log
+			rf.setNextIndex(peer, reply.ConflictIndex)
+			for i := args.PrevLogIndex; i >= 1; i-- {
+				if rf.logs[i-1].LogTerm == reply.ConflictTerm {
+					// in next trial, check if log entries in ConflictTerm matches
+					rf.setNextIndex(peer, i)
+					break
+				}
+			}
+		}
 	}
 }
 

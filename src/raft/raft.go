@@ -208,8 +208,8 @@ func (rf *Raft) getState() RaftState {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// rf.funcMu.Lock()
-	// defer rf.funcMu.Unlock()
+	rf.funcMu.Lock()
+	defer rf.funcMu.Unlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.getCurrentTerm())
@@ -330,7 +330,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = true
 			oldCommitIndex := rf.getCommitIndex()
 			if args.LeaderCommit > oldCommitIndex {
-				// TODO: set commit index ?
+				// Done: set commit index ?
 				newCommitIndex := min(rf.logs[len(rf.logs)-1].LogIndex, args.LeaderCommit)
 
 				_, _ = DBPrintf("Follower %v: change commit index to %d, oldCommitIndex: %d", rf.me, newCommitIndex, oldCommitIndex)
@@ -598,7 +598,7 @@ func (rf *Raft) killed() bool {
 // 所有的 Raft 服务器的端口（包括当前服务器的端口）。当前服务器端口是 peers[me]。
 // 所有服务器的 peers 数组都是一样的。Raft 服务器在 persister 中存储其持久状态，
 // 如果服务器有最近存储的状态，persister 就会被初始化成这些状态。
-// TODO： applyCh 是
+//
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
@@ -622,6 +622,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	// 需要尽早初始化时钟，如果在 readPersist() 之后初始化，在 Raft 节点恢复之前，
+	// 收到 AppendEntries 调用，变为 follower 并重置时钟时，Timer 还未初始化
+	rf.electionTimer = time.NewTimer(getRandElectionTimeout())
+	rf.heartBeatTimer = time.NewTimer(getHeartBeatTimeout())
 	rf.indexArrayInit()
 	// 每个 Raft 节点都会初始化一个空日志，使得 commitIndex 从 0 开始
 	rf.logs = []LogEntry{{0, 0, nil}}
@@ -765,9 +769,6 @@ func (rf *Raft) isStartTermAndState(startTerm int) bool {
 
 // 负责选举任务的 GoRoutine
 func (rf *Raft) startElectionLoop() {
-	rf.mu.Lock()
-	rf.electionTimer = time.NewTimer(getRandElectionTimeout())
-	rf.mu.Unlock()
 	for {
 		// 如果 Raft 已经被 killed 掉，就不需要接着选举了
 		// TODO：如果 Raft 从错误中恢复了呢？
@@ -851,6 +852,7 @@ func (rf *Raft) startCommitDetectionLoop() {
 		lastCommitIndex--
 		// 论文 5.4.2 小节的要求，只有最后一个需要提交的 log term 为当前轮次，才可以提交
 		// 详见论文 Figure 8 所示情景
+
 		if rf.logs[lastCommitIndex].LogTerm == rf.getCurrentTerm() {
 			for idx := nextCommitIndex; idx <= lastCommitIndex; idx++ {
 				rf.setCommitIndex(idx)
@@ -983,7 +985,7 @@ func (rf *Raft) justHeartBeat(curTerm int, peer int, wg *sync.WaitGroup) {
 
 // 负责心跳任务的 GoRoutine
 func (rf *Raft) startHeartBeatLoop() {
-	rf.heartBeatTimer = time.NewTimer(getHeartBeatTimeout())
+
 	for {
 		if rf.killed() {
 			time.Sleep(50 * time.Millisecond)
